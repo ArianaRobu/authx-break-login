@@ -1,0 +1,324 @@
+from flask import Flask, request, jsonify, session, render_template, redirect, url_for
+import sqlite3
+import bcrypt
+import os
+import secrets
+import datetime
+import time
+from functools import wraps
+
+app = Flask(__name__)
+
+# FIX 4.5: Secret key puternica, citita din variabila de mediu (nu hardcodata)
+app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+
+# FIX 4.5: Configurare sesiune securizata
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,       # Previne accesul JavaScript la cookie
+    SESSION_COOKIE_SECURE=False,        # Pune True in productie (HTTPS)
+    SESSION_COOKIE_SAMESITE='Lax',      # Protectie CSRF de baza
+    PERMANENT_SESSION_LIFETIME=datetime.timedelta(minutes=30)  # Expirare sesiune
+)
+
+DATABASE = "authx_secure.db"
+
+# Rate limiting simplu in memorie: {ip: [timestamp1, timestamp2, ...]}
+login_attempts = {}
+MAX_ATTEMPTS = 5
+LOCKOUT_SECONDS = 300  # 5 minute
+
+def get_db():
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT DEFAULT 'USER',
+            created_at TEXT,
+            locked INTEGER DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reset_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            token TEXT NOT NULL,
+            used INTEGER DEFAULT 0,
+            created_at TEXT,
+            expires_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tickets (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           title TEXT NOT NULL,
+           description TEXT,
+           severity TEXT DEFAULT 'LOW',
+           status TEXT DEFAULT 'OPEN',
+           owner_id INTEGER,
+           created_at TEXT,
+           updated_at TEXT,
+           FOREIGN KEY (owner_id) REFERENCES users(id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            resource_id TEXT,
+            user_id INTEGER,
+            action TEXT,
+            resource TEXT,
+            timestamp TEXT,
+            ip_address TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def log_action(user_id, action, resource, ip, resource_id=None):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO audit_logs (user_id, action, resource, resource_id,  timestamp, ip_address) VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, action, resource, resource_id,  datetime.datetime.now().isoformat(), ip)
+    )
+    conn.commit()
+    conn.close()
+
+# -------------------------------------------------------
+# FIX 4.1: Validare parola
+# -------------------------------------------------------
+def validate_password(password):
+    """
+    Returneaza (True, None) daca parola e valida,
+    sau (False, "mesaj eroare") daca nu.
+    """
+    if len(password) < 8:
+        return False, "Parola trebuie sa aiba minim 8 caractere."
+    if not any(c.isupper() for c in password):
+        return False, "Parola trebuie sa contina cel putin o litera mare."
+    if not any(c.isdigit() for c in password):
+        return False, "Parola trebuie sa contina cel putin o cifra."
+    if not any(c in "!@#$%^&*()_+-=[]{}|;:,.<>?" for c in password):
+        return False, "Parola trebuie sa contina cel putin un caracter special."
+    return True, None
+
+# -------------------------------------------------------
+# FIX 4.3: Rate limiting
+# -------------------------------------------------------
+def is_rate_limited(ip):
+    now = time.time()
+    attempts = login_attempts.get(ip, [])
+    # Pastreaza doar incercarile din ultimele LOCKOUT_SECONDS secunde
+    attempts = [t for t in attempts if now - t < LOCKOUT_SECONDS]
+    login_attempts[ip] = attempts
+    return len(attempts) >= MAX_ATTEMPTS
+
+def record_attempt(ip):
+    now = time.time()
+    attempts = login_attempts.get(ip, [])
+    attempts.append(now)
+    login_attempts[ip] = attempts
+
+# -------------------------------------------------------
+# REGISTER
+# -------------------------------------------------------
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'GET':
+        return render_template('register.html')
+
+    email = request.form.get('email', '').strip().lower()
+    password = request.form.get('password', '')
+
+    if not email or not password:
+        return render_template('register.html', error="Completati toate campurile.")
+
+    # FIX 4.1: Validare complexitate parola
+    valid, msg = validate_password(password)
+    if not valid:
+        return render_template('register.html', error=msg)
+
+    # FIX 4.2: Hash modern cu bcrypt (include salt automat)
+    password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
+
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO users (email, password_hash, role, created_at) VALUES (?, ?, 'USER', ?)",
+            (email, password_hash, datetime.datetime.now().isoformat())
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # FIX 4.4: Mesaj generic, nu dezvaluie daca emailul exista
+        return render_template('register.html', error="Inregistrare esuata. Verificati datele introduse.")
+    finally:
+        conn.close()
+
+    return redirect(url_for('login'))
+
+# -------------------------------------------------------
+# LOGIN
+# -------------------------------------------------------
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'GET':
+        return render_template('login.html')
+
+    ip = request.remote_addr
+
+    # FIX 4.3: Verificare rate limiting
+    if is_rate_limited(ip):
+        log_action(None, "LOGIN_BLOCKED_RATELIMIT", "auth", ip, None)
+        return render_template('login.html', error="Prea multe incercari. Asteptati 5 minute.")
+
+    email = request.form.get('email', '').strip().lower()
+    password = request.form.get('password', '')
+
+    conn = get_db()
+    user = conn.execute(
+        "SELECT * FROM users WHERE email = ?", (email,)
+    ).fetchone()
+    conn.close()
+
+    # FIX 4.4: Timp de raspuns uniform + mesaj generic
+    # Chiar daca userul nu exista, facem un bcrypt check "dummy"
+    # ca sa nu existe diferenta de timp intre "user inexistent" vs "parola gresita"
+    dummy_hash = "$2b$12$KIXBVOFbO1234567890uQeB5m6K8J9L0M1N2P3R4S5T6U7V8W9X0Y"
+
+    if user:
+        hash_to_check = user['password_hash']
+    else:
+        hash_to_check = dummy_hash
+
+    password_ok = bcrypt.checkpw(password.encode(), hash_to_check.encode())
+
+    if not user or not password_ok:
+        record_attempt(ip)
+        log_action(None, "LOGIN_FAILED", "auth", ip, None)
+        # FIX 4.4: Mesaj unic, nu dezvaluie daca userul exista
+        return render_template('login.html', error="Credentiale invalide.")
+
+    if user['locked']:
+        return render_template('login.html', error="Credentiale invalide.")
+
+    # FIX 4.5: Sesiune securizata cu expirare si rotatie
+    session.clear()  # Rotatie token - previne session fixation
+    session.permanent = True
+    session['user_id'] = user['id']
+    session['email'] = user['email']
+    session['role'] = user['role']
+    session['created_at'] = datetime.datetime.now().isoformat()
+
+    log_action(user['id'], "LOGIN_SUCCESS", "auth", ip, None)
+    return redirect(url_for('dashboard'))
+
+# -------------------------------------------------------
+# DASHBOARD
+# -------------------------------------------------------
+@app.route('/dashboard')
+def dashboard():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    return render_template('dashboard.html', email=session['email'], role=session['role'])
+
+# -------------------------------------------------------
+# LOGOUT
+# -------------------------------------------------------
+@app.route('/logout')
+def logout():
+    user_id = session.get('user_id')
+    ip = request.remote_addr
+    # FIX 4.5: Sesiunea e curatata complet
+    session.clear()
+    log_action(user_id, "LOGOUT", "auth", ip, None)
+    return redirect(url_for('login'))
+
+# -------------------------------------------------------
+# FORGOT PASSWORD
+# -------------------------------------------------------
+@app.route('/forgot-password', methods=['GET', 'POST'])
+def forgot_password():
+    if request.method == 'GET':
+        return render_template('forgottenpassword.html')
+
+    email = request.form.get('email', '').strip().lower()
+
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+
+    # FIX 4.4: Raspuns identic indiferent daca emailul exista sau nu
+    # (nu dezvaluim daca contul exista)
+    success_msg = "Daca adresa exista, vei primi un link de resetare."
+
+    if user:
+        # FIX 4.6: Token random, one-time, cu expirare de 15 minute
+        token = secrets.token_urlsafe(32)
+        expires_at = (datetime.datetime.now() + datetime.timedelta(minutes=15)).isoformat()
+
+        conn.execute(
+            "INSERT INTO reset_tokens (email, token, used, created_at, expires_at) VALUES (?, ?, 0, ?, ?)",
+            (email, token, datetime.datetime.now().isoformat(), expires_at)
+        )
+        conn.commit()
+
+        # In productie: trimite pe email. In lab: afisam link-ul.
+        reset_link = f"http://localhost:5000/reset-password?token={token}&email={email}"
+        success_msg = f"Link resetare (doar in lab): {reset_link}"
+
+    conn.close()
+    return render_template('forgottenpassword.html', success=success_msg)
+
+# -------------------------------------------------------
+# RESET PASSWORD
+# -------------------------------------------------------
+@app.route('/reset-password', methods=['GET', 'POST'])
+def reset_password():
+    token = request.args.get('token', '')
+    email = request.args.get('email', '').strip().lower()
+
+    if request.method == 'GET':
+        return render_template('resetpassword.html', token=token, email=email)
+
+    new_password = request.form.get('password', '')
+    token = request.form.get('token', '')
+    email = request.form.get('email', '').strip().lower()
+
+    # FIX 4.1: Validam si parola noua
+    valid, msg = validate_password(new_password)
+    if not valid:
+        return render_template('resetpassword.html', error=msg, token=token, email=email)
+
+    conn = get_db()
+    now = datetime.datetime.now().isoformat()
+
+    # FIX 4.6: Verificam used=0 SI expirarea tokenului
+    reset = conn.execute(
+        "SELECT * FROM reset_tokens WHERE token = ? AND email = ? AND used = 0 AND expires_at > ?",
+        (token, email, now)
+    ).fetchone()
+
+    if not reset:
+        conn.close()
+        return render_template('resetpassword.html', error="Token invalid sau expirat.", token=token, email=email)
+
+    # FIX 4.2: Hash bcrypt pentru parola noua
+    new_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt(rounds=12)).decode()
+    conn.execute("UPDATE users SET password_hash = ? WHERE email = ?", (new_hash, email))
+
+    # FIX 4.6: Marcare token ca folosit (one-time use)
+    conn.execute("UPDATE reset_tokens SET used = 1 WHERE id = ?", (reset['id'],))
+    conn.commit()
+    conn.close()
+
+    return redirect(url_for('login'))
+
+if __name__ == '__main__':
+    init_db()
+    # FIX: debug=False in productie
+    app.run(debug=False, port=5000)
